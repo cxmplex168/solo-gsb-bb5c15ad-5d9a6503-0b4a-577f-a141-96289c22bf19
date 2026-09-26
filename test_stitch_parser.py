@@ -124,6 +124,73 @@ class TestParseRowSizes(unittest.TestCase):
         self.assertEqual(p, [2000000000, 2])
 
 
+class TestDeepNesting(unittest.TestCase):
+    """深层合法嵌套不受 Python 调用栈限制（迭代解析，不展开重复）。"""
+
+    @staticmethod
+    def deep(text, depth, suffix=')*1'):
+        return '(' * depth + text + suffix * depth
+
+    def test_deep_group_repeat_single_size(self):
+        # 600 层括号、每层 *1 包住 k：消耗/产出各 1 针
+        self.assertEqual(parse_row(self.deep('k', 600)), (1, 1))
+
+    def test_deep_group_repeat_multi_size(self):
+        c, p = parse_row_sizes(self.deep('k', 600), 3)
+        self.assertEqual(c, [1, 1, 1])
+        self.assertEqual(p, [1, 1, 1])
+
+    def test_deep_group_repeat_details(self):
+        c, p, tallies = parse_row_details(self.deep('k', 600), 2)
+        self.assertEqual((c, p), ([1, 1], [1, 1]))
+        self.assertEqual(tallies['k'], [1, 1])
+
+    def test_far_beyond_call_stack_limit(self):
+        # 深度远超默认递归上限也只能受内存限制
+        self.assertEqual(parse_row(self.deep('k', 10000)), (1, 1))
+
+    def test_deep_nesting_with_inner_repeats(self):
+        # 深层嵌套内普通倍数与按尺码倍数仍按算术累计、不展开
+        c, p = parse_row_sizes(self.deep('(k yo)*{6|8}', 300), 2)
+        self.assertEqual(c, [6, 8])
+        self.assertEqual(p, [12, 16])
+
+    def test_deep_missing_paren_reports_position(self):
+        # 600 个 '(' 只有 599 个 ')'：报最外层未闭合括号的位置
+        text = '(' * 600 + 'k' + ')*1' * 599
+        with self.assertRaises(ParseError) as ctx:
+            parse_row(text)
+        self.assertIn("缺少与 '(' 对应的 ')'", str(ctx.exception))
+        self.assertEqual(ctx.exception.pos, 0)
+
+    def test_deep_bad_multiplier_reports_position(self):
+        text = '(' * 300 + 'k*0' + ')*1' * 300
+        with self.assertRaises(ParseError) as ctx:
+            parse_row(text)
+        self.assertIn('倍数必须为正整数', str(ctx.exception))
+        self.assertEqual(ctx.exception.pos, 302)  # '0' 的下标
+
+    def test_deep_size_repeat_mismatch_reports_position(self):
+        text = '(' * 300 + 'k*{2|3}' + ')*1' * 300
+        with self.assertRaises(ParseError) as ctx:
+            parse_row_sizes(text, 3)
+        self.assertIn('项数不符', str(ctx.exception))
+        self.assertEqual(ctx.exception.pos, 301)  # '*' 的下标
+
+    def test_deep_nesting_suggest_fix(self):
+        # 深层嵌套中的倍数修正建议同样只做算术（_linear_sites 不递归）
+        text = '(' * 300 + 'k*2' + ')*1' * 300
+        sug = suggest_row_fix(text, [3])
+        self.assertIsNotNone(sug)
+        self.assertEqual(sug['new'], '*3')
+        self.assertEqual(sug['produces'], [3])
+        self.assertEqual(sug['char'], 302)  # '*' 的字符位置（从 1 计）
+
+    def test_deep_nesting_huge_multiplier_not_expanded(self):
+        text = '(' * 300 + '(k)*1000000000' + ')*1' * 300
+        self.assertEqual(parse_row(text), (1000000000, 1000000000))
+
+
 class TestParseRowStitchCounts(unittest.TestCase):
     def test_basic_stitch_counts(self):
         tallies = parse_row_stitch_counts('k p yo k2tog', 1)

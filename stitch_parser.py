@@ -11,6 +11,8 @@
 
 普通 *n 对所有尺码生效，*{a|b|c} 与 *n 两种重复可互相嵌套。
 解析只做算术累计，绝不展开重复项，因此 (k)*1000000000 也能瞬间算完。
+解析与算术汇总均用显式栈迭代完成、不递归，括号嵌套深度不受 Python
+调用栈限制（数百层嵌套的合法指令也能照常给出针数）。
 
 除消耗/产出针数外，解析器还可返回每种记号（k/p/yo/k2tog）在每行中每个
 尺码的实际出现次数（parse_row_details / parse_row_stitch_counts），供线材
@@ -148,6 +150,13 @@ def _tokenize(text):
 
 
 class _Parser(object):
+    """记号流解析器（迭代实现，不递归）。
+
+    每遇 '(' 把当前层的累计器压入显式栈、另起一层累计，遇 ')' 弹栈合并，
+    因此括号嵌套深度只受内存限制，不受 Python 调用栈限制（数百层嵌套的
+    合法指令也能解析）；重复倍数只做算术累计，绝不展开。
+    """
+
     def __init__(self, tokens, num_sizes):
         self.tokens = tokens
         self.i = 0
@@ -168,80 +177,101 @@ class _Parser(object):
         num_sizes 的针数列表；tallies 为 {记号名: 长度 num_sizes 的次数列表}；
         nodes 为顶层节点列表（_StitchNode/_GroupNode），供针位预览定位，
         与算术累计来自同一条解析路径，故两者的语法检查完全一致。
-        """
-        c, p, tallies, nodes = self.parse_sequence()
-        tok = self.peek()
-        if tok is not None:
-            kind, val, pos = tok
-            if kind == 'RPAREN':
-                raise ParseError("多余的右括号 ')'（第 {} 个字符）".format(pos + 1), pos)
-            if kind == 'NUM':
-                raise ParseError(
-                    "意外的数字 {!r}（第 {} 个字符）：倍数需写成 (序列)*次数 的形式".format(val, pos + 1), pos)
-            if kind == 'STAR':
-                raise ParseError(
-                    "意外的 '*'（第 {} 个字符）：'*' 必须跟在记号或 ')' 之后".format(pos + 1), pos)
-            raise ParseError("意外的记号 {!r}（第 {} 个字符）".format(val, pos + 1), pos)
-        return c, p, tallies, nodes
 
-    def parse_sequence(self):
-        """sequence := item+，消耗/产出/记号次数逐项累加，同时收集节点"""
-        total_c = [0] * self.num_sizes
-        total_p = [0] * self.num_sizes
-        total_t = {name: [0] * self.num_sizes for name in STITCH_NAMES}
-        nodes = []
+        cur_* 为当前层（sequence := item+）的累计器；stack 保存各层未闭合
+        括号的外层现场（左括号位置, c, p, tallies, nodes），栈顶即最内层。
+        本层 sequence 结束时（遇到非记号/'(' 的记号或文本末尾）按“先查空
+        括号、再查收尾记号”的顺序处理，报错文案与字符位置与递归版一致。
+        """
+        ns = self.num_sizes
+        cur_c = [0] * ns
+        cur_p = [0] * ns
+        cur_t = {name: [0] * ns for name in STITCH_NAMES}
+        cur_nodes = []
+        stack = []
         while True:
             tok = self.peek()
-            if tok is None or tok[0] not in ('STITCH', 'LPAREN'):
-                break
-            c, p, tallies, node = self.parse_item()
-            for j in range(self.num_sizes):
-                total_c[j] += c[j]
-                total_p[j] += p[j]
-                for name in STITCH_NAMES:
-                    total_t[name][j] += tallies[name][j]
-            nodes.append(node)
-        return total_c, total_p, total_t, nodes
-
-    def parse_item(self):
-        """item := (STITCH | '(' sequence ')') ('*' repeat)?，同时返回对应节点"""
-        kind, val, pos = self.advance()
-        if kind == 'STITCH':
-            name = val.lower()
-            c0, p0 = STITCH_COUNTS[name]
-            c = [c0] * self.num_sizes
-            p = [p0] * self.num_sizes
-            tallies = {name_: [0] * self.num_sizes for name_ in STITCH_NAMES}
-            tallies[name] = [1] * self.num_sizes
-            node = _StitchNode(name, [1] * self.num_sizes)
-        else:  # LPAREN
-            c, p, tallies, children = self.parse_sequence()
-            if not any(c) and not any(p):
-                raise ParseError("括号内不能为空（第 {} 个字符）".format(pos + 1), pos)
-            tok = self.peek()
+            kind = tok[0] if tok is not None else None
+            if kind == 'STITCH':
+                self.advance()
+                name = tok[1].lower()
+                c0, p0 = STITCH_COUNTS[name]
+                tallies = {n: [0] * ns for n in STITCH_NAMES}
+                tallies[name] = [1] * ns
+                node = _StitchNode(name, [1] * ns)
+                c, p, tallies, node = self._apply_repeat(
+                    [c0] * ns, [p0] * ns, tallies, node)
+                self._accumulate(cur_c, cur_p, cur_t, c, p, tallies)
+                cur_nodes.append(node)
+                continue
+            if kind == 'LPAREN':
+                self.advance()
+                stack.append((tok[2], cur_c, cur_p, cur_t, cur_nodes))
+                cur_c = [0] * ns
+                cur_p = [0] * ns
+                cur_t = {name: [0] * ns for name in STITCH_NAMES}
+                cur_nodes = []
+                continue
+            if stack:
+                # 本层 sequence 结束：先查空括号，再按收尾记号分别处理
+                lparen_pos = stack[-1][0]
+                if not any(cur_c) and not any(cur_p):
+                    raise ParseError(
+                        "括号内不能为空（第 {} 个字符）".format(lparen_pos + 1), lparen_pos)
+                if tok is None:
+                    raise ParseError(
+                        "缺少与 '(' 对应的 ')'（第 {} 个字符）".format(lparen_pos + 1), lparen_pos)
+                if kind != 'RPAREN':
+                    raise ParseError(
+                        "括号内出现意外的记号 {!r}（第 {} 个字符）".format(tok[1], tok[2] + 1), tok[2])
+                self.advance()
+                node = _GroupNode(cur_nodes, [1] * ns)
+                c, p, tallies, node = self._apply_repeat(cur_c, cur_p, cur_t, node)
+                _lparen_pos, cur_c, cur_p, cur_t, cur_nodes = stack.pop()
+                self._accumulate(cur_c, cur_p, cur_t, c, p, tallies)
+                cur_nodes.append(node)
+                continue
             if tok is None:
-                raise ParseError("缺少与 '(' 对应的 ')'（第 {} 个字符）".format(pos + 1), pos)
-            if tok[0] != 'RPAREN':
+                return cur_c, cur_p, cur_t, cur_nodes
+            if kind == 'RPAREN':
+                raise ParseError("多余的右括号 ')'（第 {} 个字符）".format(tok[2] + 1), tok[2])
+            if kind == 'NUM':
                 raise ParseError(
-                    "括号内出现意外的记号 {!r}（第 {} 个字符）".format(tok[1], tok[2] + 1), tok[2])
-            self.advance()
-            node = _GroupNode(children, [1] * self.num_sizes)
+                    "意外的数字 {!r}（第 {} 个字符）：倍数需写成 (序列)*次数 的形式".format(tok[1], tok[2] + 1), tok[2])
+            if kind == 'STAR':
+                raise ParseError(
+                    "意外的 '*'（第 {} 个字符）：'*' 必须跟在记号或 ')' 之后".format(tok[2] + 1), tok[2])
+            raise ParseError("意外的记号 {!r}（第 {} 个字符）".format(tok[1], tok[2] + 1), tok[2])
+
+    def _accumulate(self, total_c, total_p, total_t, c, p, tallies):
+        """把一个 item 的消耗/产出/记号次数累加进当前层合计（sequence := item+）。"""
+        for j in range(self.num_sizes):
+            total_c[j] += c[j]
+            total_p[j] += p[j]
+            for name in STITCH_NAMES:
+                total_t[name][j] += tallies[name][j]
+
+    def _apply_repeat(self, c, p, tallies, node):
+        """item 的可选后缀 ('*' repeat)：有倍数时按倍数缩放累计并回填节点。
+
+        保留倍数原文区间（从 '*' 到倍数文本末尾）：parse_repeat 至少消耗
+        一个记号（否则已抛 ParseError），最后一个已消耗记号即倍数文本的
+        结尾（'*' 与倍数之间的空白一并纳入区间）。
+        """
         tok = self.peek()
-        if tok is not None and tok[0] == 'STAR':
-            self.advance()
-            mults = self.parse_repeat(tok)
-            c = [cv * m for cv, m in zip(c, mults)]
-            p = [pv * m for pv, m in zip(p, mults)]
-            tallies = {
-                name: [cnt * m for cnt, m in zip(counts, mults)]
-                for name, counts in tallies.items()
-            }
-            node.mults = mults
-            # 保留倍数原文区间（从 '*' 到倍数文本末尾）：parse_repeat 至少
-            # 消耗一个记号（否则已抛 ParseError），最后一个已消耗记号即
-            # 倍数文本的结尾（'*' 与倍数之间的空白一并纳入区间）
-            last = self.tokens[self.i - 1]
-            node.site = (tok[2], last[2] + len(last[1]))
+        if tok is None or tok[0] != 'STAR':
+            return c, p, tallies, node
+        self.advance()
+        mults = self.parse_repeat(tok)
+        c = [cv * m for cv, m in zip(c, mults)]
+        p = [pv * m for pv, m in zip(p, mults)]
+        tallies = {
+            name: [cnt * m for cnt, m in zip(counts, mults)]
+            for name, counts in tallies.items()
+        }
+        node.mults = mults
+        last = self.tokens[self.i - 1]
+        node.site = (tok[2], last[2] + len(last[1]))
         return c, p, tallies, node
 
     def parse_repeat(self, star_tok):
@@ -364,38 +394,48 @@ def _linear_sites(nodes, num_sizes):
     调用方用整行合计减去 系数 × 当前倍数 得到。子节点的倍数在原文中先于
     自身的 '*' 出现，故后序遍历返回的列表按原文位置升序。
 
+    遍历用显式栈代替递归（每帧记录节点、外层倍数积、下一个待处理子节点
+    下标与已累计的子节点贡献），嵌套深度不受 Python 调用栈限制。
+
     返回 [(star_pos, end, current, coeff_c, coeff_p), ...]：star_pos/end
     为该倍数（从 '*' 起）在原文中的区间；current 为各尺码当前倍数；
     coeff_c/coeff_p 为该倍数对各尺码整行消耗/产出的线性系数。全程只做
     算术累计，不展开重复项，也不重新解析原文。
     """
     sites = []
-
-    def walk(node, outer):
-        """返回该节点“一个副本”的 (各尺码消耗列表, 各尺码产出列表)。"""
-        if isinstance(node, _StitchNode):
-            c0, p0 = STITCH_COUNTS[node.name]
-            copy_c = [c0] * num_sizes
-            copy_p = [p0] * num_sizes
-        else:
-            child_outer = [o * m for o, m in zip(outer, node.mults)]
-            copy_c = [0] * num_sizes
-            copy_p = [0] * num_sizes
-            for child in node.children:
-                child_c, child_p = walk(child, child_outer)
-                for j in range(num_sizes):
-                    copy_c[j] += child_c[j] * child.mults[j]
-                    copy_p[j] += child_p[j] * child.mults[j]
-        if node.site is not None:
-            star_pos, end = node.site
-            sites.append((star_pos, end, list(node.mults),
-                          [cv * o for cv, o in zip(copy_c, outer)],
-                          [pv * o for pv, o in zip(copy_p, outer)]))
-        return copy_c, copy_p
-
     top_outer = [1] * num_sizes
-    for node in nodes:
-        walk(node, top_outer)
+    for root in nodes:
+        # 栈帧：[节点, 外层倍数积, 下一个待处理子节点下标, 累计消耗, 累计产出]
+        stack = [[root, top_outer, 0, [0] * num_sizes, [0] * num_sizes]]
+        while stack:
+            frame = stack[-1]
+            node, outer = frame[0], frame[1]
+            if not isinstance(node, _StitchNode) and frame[2] < len(node.children):
+                child = node.children[frame[2]]
+                frame[2] += 1
+                child_outer = [o * m for o, m in zip(outer, node.mults)]
+                stack.append([child, child_outer, 0,
+                              [0] * num_sizes, [0] * num_sizes])
+                continue
+            # 全部子节点已处理：得到本节点“一个副本”的消耗/产出
+            if isinstance(node, _StitchNode):
+                c0, p0 = STITCH_COUNTS[node.name]
+                copy_c = [c0] * num_sizes
+                copy_p = [p0] * num_sizes
+            else:
+                copy_c, copy_p = frame[3], frame[4]
+            stack.pop()
+            if node.site is not None:
+                star_pos, end = node.site
+                sites.append((star_pos, end, list(node.mults),
+                              [cv * o for cv, o in zip(copy_c, outer)],
+                              [pv * o for pv, o in zip(copy_p, outer)]))
+            if stack:
+                # 子节点按各自当前倍数计入父节点的“一个副本”
+                parent = stack[-1]
+                for j in range(num_sizes):
+                    parent[3][j] += copy_c[j] * node.mults[j]
+                    parent[4][j] += copy_p[j] * node.mults[j]
     return sites
 
 

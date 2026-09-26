@@ -72,6 +72,33 @@ class TestValidateApi(unittest.TestCase):
         self.assertEqual(data['error']['type'], 'parse')
         self.assertIn('项数不符', data['error']['message'])
 
+    def test_deep_nesting_valid(self):
+        # 600 层括号、每层 *1 包住 k：消耗/产出各 1 针，不因嵌套深度报 500
+        data = self.post(1, '(' * 600 + 'k' + ')*1' * 600)
+        self.assertTrue(data['ok'])
+        self.assertIsNone(data['error'])
+        self.assertEqual(len(data['rows']), 1)
+        self.assertEqual(data['rows'][0]['consume'], 1)
+        self.assertEqual(data['rows'][0]['produce'], 1)
+        self.assertEqual(data['final'], 1)
+
+    def test_deep_nesting_missing_paren_reports_line_and_char(self):
+        data = self.post(1, 'k*1\n' + '(' * 600 + 'k' + ')*1' * 599)
+        self.assertFalse(data['ok'])
+        err = data['error']
+        self.assertEqual(err['type'], 'parse')
+        self.assertEqual(err['line'], 2)
+        self.assertEqual(err['char'], 1)  # 最外层未闭合的 '('
+        self.assertIn("缺少与 '(' 对应的 ')'", err['message'])
+
+    def test_deep_nesting_bad_multiplier_reports_line_and_char(self):
+        data = self.post(1, '(' * 300 + 'k*0' + ')*1' * 300)
+        self.assertFalse(data['ok'])
+        err = data['error']
+        self.assertEqual(err['type'], 'parse')
+        self.assertEqual(err['line'], 1)
+        self.assertEqual(err['char'], 303)  # '0' 是第 303 个字符
+
 
 class TestValidateSizesApi(unittest.TestCase):
     SIZES = [{'name': 'S', 'cast_on': 12},
@@ -160,6 +187,41 @@ class TestValidateSizesApi(unittest.TestCase):
         self.assertEqual(err['type'], 'parse')
         self.assertEqual(err['line'], 2)
         self.assertEqual(err['char'], 5)  # '0' 是第 5 个字符
+
+    def test_deep_nesting_valid_all_sizes(self):
+        # 600 层括号、每层 *1 包住 k：各尺码消耗/产出各 1 针，不因嵌套深度报 500
+        sizes = [{'name': 'S', 'cast_on': 1}, {'name': 'M', 'cast_on': 1}]
+        data = self.post(sizes, '(' * 600 + 'k' + ')*1' * 600)
+        self.assertTrue(data['ok'])
+        for s in data['sizes']:
+            self.assertTrue(s['ok'])
+            self.assertIsNone(s['error'])
+            self.assertEqual(len(s['rows']), 1)
+            self.assertEqual(s['rows'][0]['consume'], 1)
+            self.assertEqual(s['rows'][0]['produce'], 1)
+            self.assertEqual(s['final'], 1)
+
+    def test_deep_nesting_parse_error_reports_line_and_char(self):
+        sizes = [{'name': 'S', 'cast_on': 1}, {'name': 'M', 'cast_on': 1}]
+        data = self.post(sizes, '(' * 600 + 'k' + ')*1' * 599)
+        self.assertFalse(data['ok'])
+        for s in data['sizes']:
+            err = s['error']
+            self.assertEqual(err['type'], 'parse')
+            self.assertEqual(err['line'], 1)
+            self.assertEqual(err['char'], 1)  # 最外层未闭合的 '('
+
+    def test_deep_nesting_count_error_yields_suggestion(self):
+        # 深层嵌套行的针数差额仍给出倍数修正建议（算术推导，不递归展开）
+        sizes = [{'name': 'S', 'cast_on': 3}]
+        data = self.post(sizes, '(' * 300 + 'k*2' + ')*1' * 300)
+        self.assertFalse(data['ok'])
+        self.assertEqual(data['sizes'][0]['error']['type'], 'count')
+        sug = data['suggestion']
+        self.assertIsNotNone(sug)
+        self.assertEqual(sug['line'], 1)
+        self.assertEqual(sug['new'], '*3')
+        self.assertEqual(sug['produces'], [3])
 
     def test_blank_lines_skipped_but_line_numbers_kept(self):
         data = self.post(self.SIZES, 'k*{12|16|20}\n\nssk')
