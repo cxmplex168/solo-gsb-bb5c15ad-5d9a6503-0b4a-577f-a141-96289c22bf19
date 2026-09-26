@@ -485,6 +485,133 @@ class TestValidateSizesSuggestion(unittest.TestCase):
         self.assertNotIn('suggestion', data)
 
 
+class TestDeepNestingApi(unittest.TestCase):
+    """深层合法嵌套（600 层括号逐层 *1）经两个校验接口不再栈溢出（500）。
+
+    递归解析时 600 层括号会触发 RecursionError，接口返回 500；迭代实现后
+    两个校验接口都返回有效行与最终针数，括号缺失或倍数非法仍给出原文
+    行号与字符位置。
+    """
+
+    DEEP = '(' * 600 + 'k' + ')*1' * 600  # 600 层 *1 包住 k：消耗/产出各 1
+
+    def setUp(self):
+        self.client = app.test_client()
+
+    def test_validate_deep_nesting(self):
+        data = self.client.post('/api/validate', json={
+            'cast_on': 1, 'pattern': self.DEEP,
+        }).get_json()
+        self.assertTrue(data['ok'])
+        self.assertIsNone(data['error'])
+        self.assertEqual(len(data['rows']), 1)
+        row = data['rows'][0]
+        self.assertEqual((row['line'], row['in'], row['consume'],
+                          row['produce'], row['out']), (1, 1, 1, 1, 1))
+        self.assertEqual(data['final'], 1)
+
+    def test_validate_sizes_deep_nesting(self):
+        sizes = [{'name': 'S', 'cast_on': 1}, {'name': 'M', 'cast_on': 1}]
+        data = self.client.post('/api/validate-sizes', json={
+            'sizes': sizes, 'pattern': self.DEEP,
+        }).get_json()
+        self.assertTrue(data['ok'])
+        for s in data['sizes']:
+            self.assertTrue(s['ok'])
+            self.assertIsNone(s['error'])
+            self.assertEqual(len(s['rows']), 1)
+            self.assertEqual(s['rows'][0]['consume'], 1)
+            self.assertEqual(s['rows'][0]['produce'], 1)
+            self.assertEqual(s['final'], 1)
+
+    def test_validate_sizes_deep_nesting_with_yarn(self):
+        # 深嵌套行的记号次数同样算术累计（k 恰好 1 次）
+        sizes = [{'name': 'S', 'cast_on': 1}]
+        yarn = {'k': 0.5, 'p': 0.5, 'yo': 0.2, 'k2tog': 1.0,
+                'waste_percent': 10, 'grams_per_ball': 50}
+        data = self.client.post('/api/validate-sizes', json={
+            'sizes': sizes, 'pattern': self.DEEP, 'yarn': yarn,
+        }).get_json()
+        self.assertTrue(data['ok'])
+        s = data['sizes'][0]
+        self.assertEqual(s['rows'][0]['weight'], 0.5)
+        self.assertEqual(s['yarn']['raw_total'], 0.5)
+        self.assertFalse(s['yarn']['partial'])
+
+    def test_validate_deep_nesting_count_error(self):
+        # 起针 2 而深嵌套行只消耗 1 针：报针数差额而非 500
+        data = self.client.post('/api/validate', json={
+            'cast_on': 2, 'pattern': self.DEEP,
+        }).get_json()
+        self.assertFalse(data['ok'])
+        self.assertEqual(data['error']['type'], 'count')
+        self.assertEqual(data['error']['line'], 1)
+        self.assertEqual(data['error']['diff'], -1)
+
+    def test_validate_sizes_deep_nesting_suggestion(self):
+        # 深嵌套行的倍数修正建议同样只做算术（最内层 '*' 是第 603 个字符）
+        sizes = [{'name': 'S', 'cast_on': 2}, {'name': 'M', 'cast_on': 1}]
+        data = self.client.post('/api/validate-sizes', json={
+            'sizes': sizes, 'pattern': self.DEEP,
+        }).get_json()
+        self.assertFalse(data['ok'])
+        self.assertEqual(data['sizes'][0]['error']['type'], 'count')
+        self.assertTrue(data['sizes'][1]['ok'])
+        sug = data['suggestion']
+        self.assertIsNotNone(sug)
+        self.assertEqual(sug['line'], 1)
+        self.assertEqual(sug['char'], 603)
+        self.assertEqual(sug['old'], '*1')
+        self.assertEqual(sug['new'], '*{2|1}')
+        self.assertEqual(sug['produces'], [2, 1])
+
+    def test_validate_deep_nesting_missing_paren(self):
+        # 600 层开括号只闭合 599 层：报第 2 行第 1 个字符（最外层 '('）
+        text = '(' * 600 + 'k' + ')*1' * 599
+        data = self.client.post('/api/validate', json={
+            'cast_on': 1, 'pattern': 'k\n' + text,
+        }).get_json()
+        self.assertFalse(data['ok'])
+        err = data['error']
+        self.assertEqual(err['type'], 'parse')
+        self.assertEqual(err['line'], 2)
+        self.assertEqual(err['char'], 1)
+        self.assertIn("缺少与 '(' 对应的 ')'", err['message'])
+        self.assertEqual(len(data['rows']), 1)  # 第 1 行仍是有效行
+
+    def test_validate_sizes_deep_nesting_bad_multiplier(self):
+        # 最内层倍数非法：'0' 是第 603 个字符，所有尺码一并停止
+        text = '(' * 600 + 'k*0' + ')*1' * 600
+        sizes = [{'name': 'S', 'cast_on': 1}, {'name': 'M', 'cast_on': 1}]
+        data = self.client.post('/api/validate-sizes', json={
+            'sizes': sizes, 'pattern': text,
+        }).get_json()
+        self.assertFalse(data['ok'])
+        for s in data['sizes']:
+            self.assertFalse(s['ok'])
+            self.assertEqual(s['error']['type'], 'parse')
+            self.assertEqual(s['error']['line'], 1)
+            self.assertEqual(s['error']['char'], 603)
+            self.assertIn('倍数必须为正整数', s['error']['message'])
+
+    def test_preview_and_track_deep_nesting(self):
+        # 共用同一解析路径的预览与追踪接口同样不受嵌套深度限制
+        sizes = [{'name': 'S', 'cast_on': 1}]
+        preview = self.client.post('/api/preview-row', json={
+            'sizes': sizes, 'pattern': self.DEEP, 'line': 1,
+            'size_index': 0, 'start': 1,
+        }).get_json()
+        self.assertTrue(preview['ok'])
+        self.assertEqual(preview['total'], 1)
+        self.assertEqual(preview['items'][0]['stitch'], 'k')
+        track = self.client.post('/api/track-stitch', json={
+            'sizes': sizes, 'pattern': self.DEEP, 'size_index': 0, 'needle': 1,
+        }).get_json()
+        self.assertTrue(track['ok'])
+        self.assertEqual(track['tracks'][0]['stitch'], 'k')
+        self.assertEqual(track['final_needle'], 1)
+
+
 class TestMoveSizeApi(unittest.TestCase):
     SIZES = [{'name': 'S', 'cast_on': 12},
              {'name': 'M', 'cast_on': 16},

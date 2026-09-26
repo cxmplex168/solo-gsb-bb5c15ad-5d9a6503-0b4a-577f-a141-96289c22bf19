@@ -621,6 +621,120 @@ class TestPreviewRowStitches(unittest.TestCase):
         self.assertEqual(tallies['k'], [8, 9])
 
 
+class TestDeepNesting(unittest.TestCase):
+    """深层合法嵌套（如 600 层括号逐层 *1）不受 Python 调用栈限制的回归测试。
+
+    递归解析时代码每层括号消耗两个调用栈帧，600 层即触发 RecursionError；
+    迭代实现后任意深度都应得到与浅层完全一致的算术结果与错误位置。
+    """
+
+    DEEP = '(' * 600 + 'k' + ')*1' * 600  # 任务场景：600 层 *1 包住 k
+
+    def test_deep_nesting_parse_row(self):
+        self.assertEqual(parse_row(self.DEEP), (1, 1))
+
+    def test_deep_nesting_parse_row_sizes(self):
+        c, p = parse_row_sizes(self.DEEP, 3)
+        self.assertEqual(c, [1, 1, 1])
+        self.assertEqual(p, [1, 1, 1])
+
+    def test_deep_nesting_stitch_counts(self):
+        tallies = parse_row_stitch_counts(self.DEEP, 2)
+        self.assertEqual(tallies['k'], [1, 1])
+        self.assertEqual(tallies['yo'], [0, 0])
+
+    def test_deep_nesting_nodes_not_expanded(self):
+        # 节点树保持 600 层分组嵌套，不展开重复次数
+        nodes = parse_row_nodes(self.DEEP, 1)
+        self.assertEqual(len(nodes), 1)
+        depth, node = 0, nodes[0]
+        while not hasattr(node, 'name'):
+            self.assertEqual(node.mults, [1])
+            self.assertEqual(len(node.children), 1)
+            depth += 1
+            node = node.children[0]
+        self.assertEqual(depth, 600)
+        self.assertEqual(node.name, 'k')
+
+    def test_deeper_nesting_with_multipliers(self):
+        # 2000 层逐层 *2 包住 k：消耗/产出各 2**2000，算术精确且不展开
+        text = '(' * 2000 + 'k' + ')*2' * 2000
+        c, p = parse_row_sizes(text, 2)
+        self.assertEqual(c, [2 ** 2000, 2 ** 2000])
+        self.assertEqual(p, [2 ** 2000, 2 ** 2000])
+
+    def test_deep_nesting_with_siblings(self):
+        # 400 层、每层在括号内追加一个 p：消耗/产出各 401
+        text = '(' * 400 + 'k' + ' p)*1' * 400
+        self.assertEqual(parse_row(text), (401, 401))
+
+    def test_deep_nesting_size_multipliers(self):
+        # 深层嵌套与按尺码倍数混合：*(2|3) 出现在第 300 层
+        text = '(' * 300 + '(k)*{2|3}' + ')*1' * 300
+        c, p = parse_row_sizes(text, 2)
+        self.assertEqual(c, [2, 3])
+        self.assertEqual(p, [2, 3])
+
+    def test_deep_nesting_missing_paren_reports_position(self):
+        # 600 层开括号只闭合 599 层：最外层 '(' 未闭合，报第 1 个字符
+        text = '(' * 600 + 'k' + ')*1' * 599
+        with self.assertRaises(ParseError) as ctx:
+            parse_row(text)
+        self.assertIn("缺少与 '(' 对应的 ')'", str(ctx.exception))
+        self.assertEqual(ctx.exception.pos, 0)
+
+    def test_deep_nesting_bad_multiplier_reports_position(self):
+        # 最内层 k 的倍数非法：'0' 是第 603 个字符（下标 602）
+        text = '(' * 600 + 'k*0' + ')*1' * 600
+        with self.assertRaises(ParseError) as ctx:
+            parse_row(text)
+        self.assertIn('倍数必须为正整数', str(ctx.exception))
+        self.assertEqual(ctx.exception.pos, 602)
+
+    def test_deep_nesting_unrecognized_token_reports_position(self):
+        # 最内层非法记号 's' 是第 601 个字符（下标 600）
+        text = '(' * 600 + 'ssk' + ')*1' * 600
+        with self.assertRaises(ParseError) as ctx:
+            parse_row(text)
+        self.assertEqual(ctx.exception.pos, 600)
+
+    def test_deep_nesting_suggest_row_fix(self):
+        # 可用 2 针时最内层 *1 -> *2（第 603 个字符为最内层 '*'）
+        sug = suggest_row_fix(self.DEEP, [2])
+        self.assertIsNotNone(sug)
+        self.assertEqual(sug['char'], 603)
+        self.assertEqual(sug['old'], '*1')
+        self.assertEqual(sug['new'], '*2')
+        self.assertEqual(sug['produces'], [2])
+        self.assertEqual(parse_row(sug['instruction']), (2, 2))
+
+    def test_deep_nesting_preview(self):
+        page = preview_row_stitches(self.DEEP, 1, 0, 1)
+        self.assertEqual(page['total'], 1)
+        self.assertEqual(page['consume'], 1)
+        self.assertEqual(page['produce'], 1)
+        self.assertEqual(
+            [(i['seq'], i['stitch'], i['in_from'], i['in_to'], i['out'])
+             for i in page['items']],
+            [(1, 'k', 1, 1, 1)])
+
+    def test_deep_nesting_locate_input(self):
+        hit = locate_row_input(self.DEEP, 1, 0, 1)
+        self.assertEqual(
+            (hit['stitch'], hit['in_from'], hit['in_to'], hit['seq'],
+             hit['yos_before'], hit['consume'], hit['produce']),
+            ('k', 1, 1, 1, 0, 1, 1))
+
+    def test_shallow_results_unchanged(self):
+        # 普通倍数、按尺码倍数与浅层嵌套的现有结果保持一致
+        self.assertEqual(parse_row('(k2tog yo)*6'), (12, 12))
+        self.assertEqual(parse_row('((k yo)*2 k2tog)*3'), (12, 15))
+        c, p = parse_row_sizes('(k2tog yo)*{6|8|10}', 3)
+        self.assertEqual((c, p), ([12, 16, 20], [12, 16, 20]))
+        c, p = parse_row_sizes('((k yo)*2)*{2|3}', 2)
+        self.assertEqual((c, p), ([4, 6], [8, 12]))
+
+
 class TestLocateRowInput(unittest.TestCase):
     """跨行追踪的“按入针序号定位”单测。"""
 
